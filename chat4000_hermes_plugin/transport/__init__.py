@@ -20,6 +20,7 @@ from ..protocol_types import (
     ConnectionState,
     InnerMessage,
     OutboundAck,
+    OutboundAttachment,
     OutboundAudio,
     OutboundImage,
     OutboundMessage,

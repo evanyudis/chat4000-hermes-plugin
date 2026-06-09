@@ -164,6 +164,14 @@ InnerMessageType = Literal[
     "tool_start",
     "tool_delta",
     "tool_end",
+    # File attachment — added 2026-06; backwards-compatible.
+    # Carries arbitrary file data (PDF, zip, doc, etc.) with metadata.
+    "attachment",
+    # Info request/response — added 2026-06; backwards-compatible.
+    # Lets the Swift client query accounts, models, and status over the
+    # same encrypted relay instead of reaching for a separate HTTP API.
+    "info_request",
+    "info_response",
 ]
 
 InnerAckStage = Literal["received", "processing", "displayed"]
@@ -226,6 +234,24 @@ class OutboundAudio:
     duration_ms: int
     waveform: list[float]
     kind: Literal["audio"] = "audio"
+
+
+@dataclass
+class OutboundAttachment:
+    """Generic file attachment (PDF, zip, document, etc.).
+
+    Carries raw file data as base64 alongside metadata so the receiver
+    can reconstruct the original file. The `text` field is an optional
+    caption/message accompanying the file.
+
+    The data is encoded as base64 in the wire frame (same as image/audio)
+    and cached to disk on the receiving end so Hermes tools (read_file,
+    etc.) can reference it by path."""
+    data: bytes
+    mime_type: str
+    filename: str
+    text: str = ""
+    kind: Literal["attachment"] = "attachment"
 
 
 @dataclass
@@ -297,10 +323,22 @@ class OutboundToolEnd:
     kind: Literal["toolEnd"] = "toolEnd"
 
 
+@dataclass
+class OutboundInfoResponse:
+    """Response to a client info_request over the relay.
+
+    Carries the result of a model/accounts/status query in ``body``.
+    The client correlates by ``ref`` (the original info_request.id)."""
+    body: dict
+    ref: str
+    kind: Literal["infoResponse"] = "infoResponse"
+
+
 OutboundMessage = (
     OutboundText
     | OutboundImage
     | OutboundAudio
+    | OutboundAttachment
     | OutboundTextDelta
     | OutboundTextEnd
     | OutboundStatus
@@ -308,6 +346,7 @@ OutboundMessage = (
     | OutboundToolStart
     | OutboundToolDelta
     | OutboundToolEnd
+    | OutboundInfoResponse
 )
 
 

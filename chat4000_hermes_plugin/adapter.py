@@ -30,32 +30,22 @@ import time
 import uuid
 from typing import Any, Optional
 
-from .accounts import resolve_chat4000_account
-from .dispatch.stream_dispatcher import StreamDispatcher
-from .dispatch.tool_call_dispatcher import ToolCallDispatcher
-from .session_binding import (
-    get_chat4000_session_binding,
-    pick_default_hermes_session,
-)
-from .transport import GroupConfig as TransportGroupConfig
-from .transport.registry import (
-    get_transport,
-    register_transport,
-    unregister_transport,
-)
-from .transport.relay import RelayMessageTransport
+from .accounts import resolve_chat4000_account, list_chat4000_account_ids, get_default_chat4000_account_id
 from .protocol_types import (
     ConnectionFailed,
     InnerMessage,
     OutboundAck,
     OutboundAudio,
+    OutboundAttachment,
     OutboundImage,
+    OutboundInfoResponse,
     OutboundStatus,
     OutboundText,
 )
 
 logger = logging.getLogger(__name__)
 
+from .session_registry import get_registry
 # Lazy imports below — Hermes' BasePlatformAdapter lives in the host
 # process. We avoid importing at module top so test/CI runs without the
 # Hermes core present still pass.
@@ -98,11 +88,12 @@ class Chat4000Adapter:  # subclass of BasePlatformAdapter, lazily resolved
         self._handlers_unsubscribe: list = []
         # Captured at connect-time for plugin_hooks to schedule async
         # frame emissions on the right asyncio loop.
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        # Make this adapter visible to plugin-level tool hooks. Weakref-
-        # backed, so a crashed adapter doesn't leak.
-        from .plugin_hooks import register_active_adapter
-        register_active_adapter(self)
+        extra = getattr(config, "extra", {}) or {}
+        self._account_id = extra.get("accountId") or extra.get("account_id") or "default"
+        self._config = config
+        self._cfg = extra  # raw extras for resolve_chat4000_account
+        self._transports: dict[str, RelayMessageTransport] = {}
+        self._transport: Optional[RelayMessageTransport] = None
 
     @property
     def name(self) -> str:
@@ -111,65 +102,89 @@ class Chat4000Adapter:  # subclass of BasePlatformAdapter, lazily resolved
     # ─── BasePlatformAdapter — lifecycle ─────────────────────────────────
 
     async def connect(self) -> bool:
-        # Capture the running event loop so plugin_hooks (called from the
-        # synchronous tool-execution path) can schedule async frame
-        # emissions back onto our loop.
+        """Connect ALL configured accounts, each with its own relay transport.
+
+        Each account gets an independent WebSocket connection to the relay
+        and routes to a separate Hermes agent session (via distinct chat_id).
+        """
         try:
             self._loop = asyncio.get_running_loop()
         except RuntimeError:
             self._loop = None
 
-        # Resolve the account from extras (config.yaml) merged with env.
-        # We pass a synthetic `cfg` shape that resolve_chat4000_account
-        # understands so we can reuse the TS-port logic 1:1.
-        synthetic_cfg = {"channels": {"chat4000": {"accounts": {self._account_id: self._cfg}}}}
-        account = resolve_chat4000_account(synthetic_cfg, self._account_id)
+        # Resolve accounts from config merged with env.
+        synthetic_cfg = {"channels": {"chat4000": {"accounts": {}}}}
+        if self._cfg:
+            synthetic_cfg["channels"]["chat4000"]["accounts"][self._account_id] = self._cfg
 
-        if not account.configured:
+        account_ids = list_chat4000_account_ids(synthetic_cfg)
+        if not account_ids:
+            account_ids = [self._account_id]
+
+        connected_any = False
+        for aid in account_ids:
+            account = resolve_chat4000_account(synthetic_cfg, aid)
+            if not account.configured:
+                logger.info(
+                    "chat4000: account %r not configured — skipping. Run `hermes chat4000 pair`.",
+                    aid,
+                )
+                continue
+
+            transport = RelayMessageTransport(abort_signal=self._abort_signal)
+            register_transport(aid, transport)
+            self._transports[aid] = transport
+
+            # Wrap receive handler to capture the account_id context
+            def _wire_handlers(aid_: str, t: RelayMessageTransport) -> None:
+                nonlocal connected_any  # type: ignore[assignment]
+                unsub_recv = t.on_receive(
+                    lambda inner: self._on_inner_received(inner, account_id=aid_, transport=t)
+                )
+                unsub_state = t.on_connection_state(
+                    lambda s: self._on_connection_state(aid_, s)
+                )
+                self._handlers_unsubscribe.extend([unsub_recv, unsub_state])
+
+            _wire_handlers(aid, transport)
+
+            transport.connect(
+                TransportGroupConfig(
+                    account_id=account.account_id,
+                    group_id=account.group_id,
+                    group_key_bytes=account.group_key_bytes,
+                    relay_url=account.relay_url,
+                    release_channel=account.config.release_channel,
+                    runtime_log_level=account.runtime_log_level,
+                )
+            )
+            get_registry().register(aid, account, transport)
+            connected_any = True
+
+        if not connected_any:
             logger.error(
-                "chat4000 not configured for account %r — run `hermes chat4000 pair`",
-                self._account_id,
+                "chat4000: no configured accounts found — run `hermes chat4000 pair`"
             )
             return False
 
-        transport = RelayMessageTransport(abort_signal=self._abort_signal)
-        register_transport(self._account_id, transport)
-        self._transport = transport
-
-        # Inbound dispatch — decrypt, then route to Hermes agent or to
-        # inner-side handlers (acks, streaming chunks from peer apps).
-        unsub_recv = transport.on_receive(self._on_inner_received)
-        unsub_state = transport.on_connection_state(self._on_connection_state)
-        self._handlers_unsubscribe = [unsub_recv, unsub_state]
-
-        transport.connect(
-            TransportGroupConfig(
-                account_id=account.account_id,
-                group_id=account.group_id,
-                group_key_bytes=account.group_key_bytes,
-                relay_url=account.relay_url,
-                release_channel=account.config.release_channel,
-                runtime_log_level=account.runtime_log_level,
+        # Primary transport for tool dispatcher and backward compat
+        primary = self._transports.get(self._account_id)
+        if primary is None:
+            primary = next(iter(self._transports.values()), None)
+        self._transport = primary
+        if primary is not None:
+            self._tool_dispatcher = ToolCallDispatcher(
+                send=lambda msg: primary.send(msg) if primary else None,  # type: ignore[union-attr]
             )
-        )
 
-        # Build the tool-call dispatcher at connect-time so plugin_hooks
-        # can push frames as soon as Hermes' tool_executor invokes our
-        # pre_tool_call / post_tool_call hooks. Previously this lived
-        # inside reply_pipeline_options() — which Hermes never calls on
-        # the standard run path — so the dispatcher was permanently None
-        # and every tool frame got dropped.
-        self._tool_dispatcher = ToolCallDispatcher(
-            send=lambda msg: self._transport.send(msg) if self._transport else None,  # type: ignore[union-attr]
-        )
-
-        self._mark_connected()  # BasePlatformAdapter helper
+        self._mark_connected()
         self._connected = True
         from . import analytics
-        analytics.track("gateway_started", {"account_layout": "default"})
+        analytics.track("gateway_started", {"account_count": len(self._transports)})
         return True
 
     async def disconnect(self) -> None:
+        """Disconnect ALL transports and reset state."""
         self._connected = False
         from . import analytics
         analytics.track("gateway_stopped", {})
@@ -189,17 +204,20 @@ class Chat4000Adapter:  # subclass of BasePlatformAdapter, lazily resolved
         if self._tool_dispatcher is not None:
             self._tool_dispatcher.dispose()
             self._tool_dispatcher = None
-        if self._transport is not None:
-            await self._transport.disconnect()
-            unregister_transport(self._account_id)
-            self._transport = None
+        # Disconnect all transports
+        for aid, transport in list(self._transports.items()):
+            try:
+                await transport.disconnect()
+            except Exception:
+                pass
+            unregister_transport(aid)
+            get_registry().unregister(aid)
+        self._transports.clear()
+        self._transport = None
         try:
             self._mark_disconnected()
         except Exception:
             pass
-
-    # ─── BasePlatformAdapter — sending ───────────────────────────────────
-
     async def send(
         self,
         chat_id: str,
@@ -210,20 +228,15 @@ class Chat4000Adapter:  # subclass of BasePlatformAdapter, lazily resolved
     ):
         """Hermes calls this when the agent has a final reply to deliver.
 
-        For text replies that came through the agent's streaming pipeline,
-        we've already been forwarding text_delta / text_end via the
-        per-turn StreamDispatcher and `content` here is the assembled
-        text we can ignore (the dispatcher already closed the stream).
-
-        For oneshot text replies (non-streaming agents, slash-command
-        responses, error messages), we send a plain `text` frame."""
+        Uses ``chat_id`` to route to the correct account's transport.
+        Falls back to ``self._account_id`` when chat_id doesn't match any
+        known transport (backward compat)."""
         from gateway.platforms.base import SendResult  # type: ignore[import-not-found]
 
-        if self._transport is None:
+        transport = self._get_transport_for_chat(chat_id)
+        if transport is None:
             return SendResult(success=False, error="transport not connected")
 
-        # `content` shape per BasePlatformAdapter: usually a string;
-        # sometimes a dict with `text` + `media_url`. Be defensive.
         if isinstance(content, dict):
             text = content.get("text", "") or ""
             media_url = content.get("media_url")
@@ -232,42 +245,40 @@ class Chat4000Adapter:  # subclass of BasePlatformAdapter, lazily resolved
             media_url = None
 
         if media_url:
-            # V1: surface the media URL as an inline link inside text. The
-            # native media-attachment path (file/image bytes over the wire)
-            # is Tier 2-F and not in scope.
             text = (text + ("\n\n" if text else "") + f"Attachment: {media_url}").strip()
 
         if not text:
             return SendResult(success=True, message_id="")
 
-        # If the StreamDispatcher already closed this turn's stream, send
-        # an oneshot text frame. Otherwise it means we never streamed and
-        # this is a complete reply.
-        wire_id = self._transport.send(OutboundText(text=text))
+        wire_id = transport.send(OutboundText(text=text))
         return SendResult(success=True, message_id=wire_id)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        # Signature MUST match BasePlatformAdapter.send_typing(self,
-        # chat_id, metadata=None). Without the `metadata` kwarg, Hermes'
-        # _keep_typing loop calls `self.send_typing(chat_id, metadata=…)`
-        # → TypeError → silently swallowed → typing indicator never
-        # fires on the iOS side and the user waits seconds before any
-        # signal. This was the cause of the "5s till typing" report.
-        if self._transport is None:
+        transport = self._get_transport_for_chat(chat_id)
+        if transport is None:
             return
-        self._transport.send(OutboundStatus(status="typing"))
+        transport.send(OutboundStatus(status="typing"))
 
     async def send_image(self, chat_id, image_url, caption=None):
         from gateway.platforms.base import SendResult  # type: ignore[import-not-found]
-        # V1: outgoing image via URL — surface as link in a text frame.
-        # Native image transport from plugin to app is symmetric to inbound
-        # but not commonly used by Hermes agents (most images come from
-        # the user toward the agent, not the other way).
         text = (caption + "\n\n" if caption else "") + f"Image: {image_url}"
-        if self._transport is None:
+        transport = self._get_transport_for_chat(chat_id)
+        if transport is None:
             return SendResult(success=False, error="transport not connected")
-        wire_id = self._transport.send(OutboundText(text=text))
+        wire_id = transport.send(OutboundText(text=text))
         return SendResult(success=True, message_id=wire_id)
+
+    def _get_transport_for_chat(self, chat_id: str) -> Optional[RelayMessageTransport]:
+        """Return the relay transport for a given chat_id.
+
+        The chat_id format is ``chat4000:{account_id}``. Falls back to
+        ``self._account_id`` stripped of prefix, then to the primary transport.
+        """
+        if not chat_id:
+            return self._transport
+        # Strip "chat4000:" prefix if present
+        aid = chat_id.removeprefix("chat4000:")
+        return self._transports.get(aid) or self._transport
 
     async def get_chat_info(self, chat_id) -> dict:
         return {"name": f"chat4000 ({chat_id[:8]}...)", "type": "dm", "chat_id": chat_id}
@@ -369,14 +380,16 @@ class Chat4000Adapter:  # subclass of BasePlatformAdapter, lazily resolved
 
     # ─── Inbound dispatch ────────────────────────────────────────────────
 
-    def _on_inner_received(self, inner: InnerMessage) -> Any:
+    def _on_inner_received(
+        self,
+        inner: InnerMessage,
+        account_id: str = "",
+        transport: Optional[MessageTransport] = None,
+    ) -> Any:
         """Called once per decrypted+dedup'd inbound inner message.
 
-        We don't aggregate inbound streamed text (text_delta/text_end from
-        peer apps) — Hermes agents talk to ONE chat4000 group at a time
-        and the only streamed sender we care about is the agent itself
-        going the OTHER direction. Same logic as the TS plugin's
-        `handleInbound` for the "ignore inbound stream" branch."""
+        ``account_id`` identifies which chat4000 group this message arrived
+        on, so we route to the correct Hermes agent session."""
         is_from_app = inner.from_ is not None and inner.from_.role == "app"
 
         if inner.t == "ack":
@@ -387,24 +400,101 @@ class Chat4000Adapter:  # subclass of BasePlatformAdapter, lazily resolved
             # Anything we don't dispatch into the agent runner.
             return
 
-        if inner.t not in ("text", "image", "audio"):
+        if inner.t == "info_request":
+            # Handle info requests directly — no Hermes agent dispatch.
+            # Client queries for accounts, models, and status go through the
+            # same encrypted relay rather than a separate HTTP API.
+            return asyncio.ensure_future(
+                self._handle_info_request(inner, transport=transport)
+            )
+
+        if inner.t not in ("text", "image", "audio", "attachment"):
             return
 
         # Emit Flow B inner ack BEFORE running the agent so the iPhone
         # ✓✓ tick lights up immediately, not after token generation.
-        if is_from_app and self._transport is not None:
+        tr = transport or self._transport
+        if is_from_app and tr is not None:
             try:
-                self._transport.send(OutboundAck(refs=inner.id, stage="received"))
+                tr.send(OutboundAck(refs=inner.id, stage="received"))
             except Exception:
                 pass
 
         # Dispatch to the Hermes agent runner via BasePlatformAdapter.
-        return asyncio.ensure_future(self._dispatch_to_agent(inner))
+        return asyncio.ensure_future(
+            self._dispatch_to_agent(inner, account_id=account_id)
+        )
 
-    async def _dispatch_to_agent(self, inner: InnerMessage) -> None:
+    async def _handle_info_request(
+        self,
+        inner: InnerMessage,
+        transport: Optional[MessageTransport] = None,
+    ) -> None:
+        """Respond to an info_request from the Swift client over the relay.
+
+        Dispatch is by ``body.type``. Supported types:
+
+        - ``accounts`` — list of configured accounts with state
+        - ``models`` — available models from Hermes provider config
+        - ``status`` — adapter status (connected accounts, relay health)
+        """
+        req_type = (inner.body or {}).get("type", "")
+        tr = transport or self._transport
+
+        if req_type == "accounts":
+            try:
+                from .accounts import resolve_chat4000_account  # noqa: F811
+                from gateway.config import load_config
+                cfg = load_config()
+                ids = list_chat4000_account_ids(cfg)
+                accounts = []
+                for aid in ids:
+                    acct = resolve_chat4000_account(cfg, aid)
+                    accounts.append({
+                        "account_id": acct.account_id,
+                        "enabled": acct.enabled,
+                        "configured": acct.configured,
+                        "group_id": acct.group_id or "",
+                        "key_source": acct.key_source,
+                    })
+                if tr is not None:
+                    tr.send(OutboundInfoResponse(
+                        body={"type": "accounts", "accounts": accounts},
+                        ref=inner.id,
+                    ))
+            except Exception as exc:
+                logger.warning("chat4000: info_request accounts failed: %s", exc)
+
+        elif req_type == "models":
+            try:
+                models = list_available_models()
+                if tr is not None:
+                    tr.send(OutboundInfoResponse(
+                        body={"type": "models", "models": models},
+                        ref=inner.id,
+                    ))
+            except Exception as exc:
+                logger.warning("chat4000: info_request models failed: %s", exc)
+
+        elif req_type == "status":
+            try:
+                connected_accounts = list(self._transports.keys()) if hasattr(self, "_transports") else []
+                if tr is not None:
+                    tr.send(OutboundInfoResponse(
+                        body={"type": "status", "connected_accounts": connected_accounts},
+                        ref=inner.id,
+                    ))
+            except Exception as exc:
+                logger.warning("chat4000: info_request status failed: %s", exc)
+
+    async def _dispatch_to_agent(
+        self, inner: InnerMessage, account_id: str = ""
+    ) -> None:
         """Hand the inbound text/image/audio to Hermes.
 
-        BasePlatformAdapter.handle_message is the canonical entry point —
+        ``account_id`` identifies which chat4000 group this message was
+        received on; used to route to the correct Hermes agent session
+        via a distinct chat_id in the SessionSource.
         it constructs a MessageEvent, builds the SessionSource, and routes
         through the gateway's session-resolution + agent-dispatch pipeline.
         That's the exact path the Telegram/Slack/Discord adapters take.
@@ -469,27 +559,74 @@ class Chat4000Adapter:  # subclass of BasePlatformAdapter, lazily resolved
                     )
                 except Exception as exc:
                     logger.warning("chat4000: failed to cache inbound audio: %s", exc)
+        elif inner.t == "attachment":
+            message_type = MessageType.TEXT  # Treat as text with attached file
+            mime = (inner.body or {}).get("mime_type", "application/octet-stream")
+            filename = (inner.body or {}).get("filename", "attachment")
+            text = (inner.body or {}).get("text", "")
+            data_b64 = (inner.body or {}).get("data_base64", "")
+            if data_b64:
+                try:
+                    raw = base64.b64decode(data_b64)
+                    # Cache to ~/.hermes/cache/attachments/ with original filename
+                    from ..key_store import resolve_hermes_state_dir
+                    cache_dir = resolve_hermes_state_dir() / "cache" / "attachments"
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    import shutil
+                    dest = cache_dir / filename
+                    # Avoid overwriting existing files — append counter if needed
+                    if dest.exists():
+                        stem = dest.stem
+                        suffix = dest.suffix
+                        counter = 1
+                        while (cache_dir / f"{stem}_{counter}{suffix}").exists():
+                            counter += 1
+                        dest = cache_dir / f"{stem}_{counter}{suffix}"
+                    dest.write_bytes(raw)
+                    media_urls.append(str(dest))
+                    media_types.append(mime)
+                    logger.info(
+                        "chat4000: cached inbound attachment (%s, %s, %d bytes) → %s",
+                        filename, mime, len(raw), dest,
+                    )
+                except Exception as exc:
+                    logger.warning("chat4000: failed to cache inbound attachment: %s", exc)
         else:
             return
 
+        # Extract optional model override from the app-sent inner body.
+        # When present, embed it in raw_message so Hermes' gateway can
+        # route to the requested model for this turn.
+        model = (inner.body or {}).get("model") or None
+        if model:
+            logger.info(
+                "chat4000: model override: %s (inner.id=%s)",
+                model, inner.id,
+            )
+
         # Build the SessionSource via BasePlatformAdapter helper so the
         # gateway recognises us as a regular platform.
+        # Use ``chat4000:{account_id}`` as the chat_id so each account
+        # gets its own Hermes agent session.
+        effective_account = account_id or self._account_id
         source = self.build_source(
-            chat_id=self._account_id,
-            user_id=(inner.from_.device_id if inner.from_ else None) or self._account_id,
+            chat_id=f"chat4000:{effective_account}",
+            user_id=(inner.from_.device_id if inner.from_ else None) or effective_account,
             chat_type="dm",
         )
 
+        raw_msg = inner.to_wire()
+        if model:
+            raw_msg["model"] = model
         event = MessageEvent(
             text=text,
             message_type=message_type,
             source=source,
-            raw_message=inner.to_wire(),
+            raw_message=raw_msg,
             message_id=inner.id,
             media_urls=media_urls,
             media_types=media_types,
         )
-
         # handle_message is BasePlatformAdapter's bridge into the gateway
         # runner. The runner then constructs the agent, sets up the reply
         # pipeline with our `reply_pipeline_options`, and ships a final
@@ -664,3 +801,42 @@ def register(ctx) -> None:
     if hasattr(ctx, "register_cli"):
         from .cli import register_chat4000_cli
         register_chat4000_cli(ctx)
+
+    # API endpoints for Swift client integration. The Hermes gateway may
+    # or may not support plugin API route registration depending on the
+    # version — log and continue either way.
+    try:
+        from .api import register_plugin_api
+        register_plugin_api(ctx)
+    except Exception:
+        logger.info("chat4000: plugin API routes skipped (not supported by this Hermes version)")
+
+def list_available_models() -> list[dict]:
+    """Return available models from Hermes' provider config.
+
+    Reads the configured providers and their models from Hermes' config
+    system. Returns a list of dicts with ``name``, ``provider``, and
+    ``group`` keys the Swift client can surface for model selection.
+
+    Returns an empty list if Hermes config is not readable (e.g. during
+    unit tests or cold install).
+    """
+    try:
+        from gateway.config import load_config  # type: ignore[import-not-found]
+        config = load_config()
+        models = []
+        providers = (config or {}).get("providers") or {}
+        for provider_name, provider_cfg in providers.items():
+            raw_models = provider_cfg.get("models") or provider_cfg.get("model") or []
+            if isinstance(raw_models, str):
+                raw_models = [raw_models]
+            for model_name in raw_models:
+                if isinstance(model_name, str) and model_name.strip():
+                    models.append({
+                        "name": model_name.strip(),
+                        "provider": provider_name,
+                        "group": provider_cfg.get("group", "default"),
+                    })
+        return models
+    except Exception:
+        return []

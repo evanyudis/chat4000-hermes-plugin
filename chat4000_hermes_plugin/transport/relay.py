@@ -45,6 +45,7 @@ from ..protocol_types import (
     InnerMessage,
     InnerMessageFrom,
     OutboundAck,
+    OutboundAttachment,
     OutboundAudio,
     OutboundImage,
     OutboundMessage,
@@ -55,6 +56,7 @@ from ..protocol_types import (
     OutboundToolDelta,
     OutboundToolEnd,
     OutboundToolStart,
+    OutboundInfoResponse,
     StatusUpdate,
 )
 from . import (
@@ -167,6 +169,18 @@ class RelayMessageTransport(MessageTransport):
                 },
                 notify_if_offline=True,
             )
+        if isinstance(msg, OutboundAttachment):
+            import base64
+            return self._ship_inner(
+                "attachment",
+                {
+                    "data_base64": base64.b64encode(msg.data).decode("ascii"),
+                    "mime_type": msg.mime_type,
+                    "filename": msg.filename,
+                    "text": msg.text,
+                },
+                notify_if_offline=True,
+            )
         # Tool-call frames — Hermes-specific. notify_if_offline=False because
         # tools don't justify a silent-push wake on their own.
         if isinstance(msg, OutboundToolStart):
@@ -207,6 +221,14 @@ class RelayMessageTransport(MessageTransport):
             )
             self._tool_ended_wire_id[msg.tool_id] = wire_id
             return wire_id
+
+        if isinstance(msg, OutboundInfoResponse):
+            return self._ship_inner(
+                "info_response",
+                {**msg.body, "ref": msg.ref},
+                notify_if_offline=False,
+            )
+
 
         raise TypeError(f"unsupported OutboundMessage: {type(msg).__name__}")
 
@@ -693,15 +715,14 @@ class RelayMessageTransport(MessageTransport):
             except Exception:
                 pass
 
-
 def _to_consumer_inner(wire: dict) -> Optional[InnerMessage]:
     """Convert a parsed wire dict into a typed InnerMessage. Returns None
     for unrecognized inner types (forward-compat — older receivers ignore
     new types like tool_start/tool_delta/tool_end)."""
-    t = wire.get("t")
     if t not in (
-        "text", "image", "audio", "text_delta", "text_end", "status", "ack",
+        "text", "image", "audio", "attachment", "text_delta", "text_end", "status", "ack",
         "tool_start", "tool_delta", "tool_end",
+        "info_request", "info_response",
     ):
         return None
     from_raw = wire.get("from")

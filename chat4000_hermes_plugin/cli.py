@@ -223,6 +223,30 @@ def _build_chat4000_cli():
         except Exception as exc:
             _handle_cli_error(exc)
 
+    @chat4000.command("models")
+    @click.option("--provider", default=None, help="Filter by provider name.")
+    def cmd_models(provider):
+        """List available models from Hermes' provider config."""
+        try:
+            from .adapter import list_available_models
+            models = list_available_models()
+            if provider:
+                models = [m for m in models if m["provider"] == provider]
+            if not models:
+                click.echo("No models configured. Run `hermes model add` first.")
+                return
+            # Group and sort by provider
+            by_provider: dict[str, list[str]] = {}
+            for m in models:
+                by_provider.setdefault(m["provider"], []).append(m["name"])
+            for prov in sorted(by_provider):
+                names = sorted(by_provider[prov])
+                click.echo(f"\n{prov}:")
+                for n in names:
+                    click.echo(f"  - {n}")
+        except Exception as exc:
+            _handle_cli_error(exc)
+
     @chat4000.command("reset")
     @click.option("--account", default="default", help="Account id")
     def cmd_reset(account):

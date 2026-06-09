@@ -11,6 +11,7 @@ from typing import Optional
 
 from ..protocol_types import (
     InnerMessage,
+    OutboundAttachment,
     OutboundAck,
     OutboundMessage,
     OutboundTextEnd,
